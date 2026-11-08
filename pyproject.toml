@@ -1,0 +1,25 @@
+[project]
+name = "async_remote"
+version = "0.1.0"
+description = "Async-capable Pyro-style object proxy over CoAP"
+requires-python = ">=3.10"
+dependencies = [
+    "aiocoap>=0.4.7",
+    "cbor2>=6",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["async_remote"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9", "pytest-asyncio>=0.23,<2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+markers = ["performance: scale and performance evaluation tests"]
