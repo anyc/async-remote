@@ -53,6 +53,23 @@ class ChangingResult:
 		return self.value
 
 
+class CallbackReceiver:
+	def __init__(self):
+		self.result = None
+
+	@async_remote.expose
+	def completed(self, value):
+		self.result = value
+		return "received " + value
+
+
+class CallbackTask:
+	@async_remote.expose
+	async def finish(self, callback):
+		callback_method = await callback.completed
+		return await callback_method("done")
+
+
 def free_udp_port():
 	with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
 		sock.bind(("127.0.0.1", 0))
@@ -68,6 +85,21 @@ def test_cbor_round_trip(example):
 	server = async_remote.Server(example)
 	encoded = server.dumps({"value": [1, "two", ("three",)]})
 	assert __import__("cbor2").loads(encoded) == {"value": [1, "two", ["three"]]}
+
+
+def test_proxy_uses_callback_tag_for_other_host():
+	from cbor2 import CBORTag, loads
+
+	sender = async_remote.AsyncObjectProxy(host="coap://sender.example")
+	proxy = async_remote.AsyncObjectProxy(
+		uri="coap://callback.example:5683/callback",
+		root_proxy=sender,
+	)
+	encoded = sender.dumps(proxy)
+	tag = loads(encoded)
+	assert isinstance(tag, CBORTag)
+	assert tag.tag == 1001
+	assert tag.value == "0"
 
 
 @pytest.mark.asyncio
@@ -200,3 +232,35 @@ async def test_repeated_access_to_same_object_returns_updated_results():
 	finally:
 		await client.close()
 		await server.close()
+
+
+@pytest.mark.asyncio
+async def test_client_object_callback_round_trip():
+	callback_port = free_udp_port()
+	service_port = free_udp_port()
+	callback_object = CallbackReceiver()
+	callback_server = async_remote.Server(
+		callback_object, bind=("127.0.0.1", callback_port)
+	)
+	service_server = async_remote.Server(
+		CallbackTask(), bind=("127.0.0.1", service_port)
+	)
+	await callback_server.serve()
+	await service_server.serve()
+	client = async_remote.AsyncObjectProxy(
+		host=f"coap://127.0.0.1:{service_port}",
+		context=callback_server.context,
+	)
+	await client.init()
+	callback_proxy = async_remote.AsyncObjectProxy(
+		host=f"coap://127.0.0.1:{callback_port}",
+		obj_path="0",
+		root_proxy=client,
+	)
+	try:
+		assert await client.finish(callback_proxy) == "received done"
+		assert callback_object.result == "done"
+	finally:
+		await client.close()
+		await service_server.close()
+		await callback_server.close()

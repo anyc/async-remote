@@ -4,8 +4,11 @@
 Each request is a CBOR map. Its ``rt`` field means "request type" and tells
 the server which operation to perform: ``pr`` reads an attribute, ``c`` calls
 a method with ``n`` (its name) and ``a`` (its arguments), and ``idx`` lists
-callable names. Replies wrap values as ``{"t": 0, "v": value}``; object
-references use CBOR tag 1000 and resolve to another proxy.
+callable names. Replies wrap values as ``{"t": 0, "v": value}``.
+Server-owned references use tag 1000 and contain an object path. Client-owned
+callback references use tag 1001 and contain an object path. The callback
+endpoint is the peer that sent the request. Tag 1002 is
+reserved for tuple values.
 """
 
 import aiocoap
@@ -19,6 +22,8 @@ REQUEST_PROPERTY = "pr"
 REQUEST_CALL = "c"
 REQUEST_INDEX = "idx"
 OBJECT_TAG = 1000
+CALLBACK_OBJECT_TAG = 1001
+TUPLE_TAG = 1002
 VALUE_REPLY_TYPE = 0
 
 class CoapResource(resource.Resource):
@@ -39,7 +44,10 @@ class CoapResource(resource.Resource):
 			print("rx", request.opt.uri_path)
 		
 		try:
-			data = await self.server.loads(request.payload)
+			data = await self.server.loads(
+				request.payload,
+				callback_remote=request.remote,
+			)
 		except Exception:
 			return aiocoap.Message(code=aiocoap.BAD_REQUEST)
 		if not isinstance(data, dict):
@@ -114,12 +122,13 @@ class CoapResource(resource.Resource):
 class AsyncRemoteBase():
 	# Tag 1000 denotes a server-side object reference, not a serialized copy.
 	cbor2_obj_tag = OBJECT_TAG
-	cbor2_tuple_tag = 1001
+	cbor2_callback_obj_tag = CALLBACK_OBJECT_TAG
+	cbor2_tuple_tag = TUPLE_TAG
 	
 	def __init__(self):
 		self.local_objs = {}
 	
-	async def loads(self, data):
+	async def loads(self, data, callback_remote=None):
 		from cbor2 import CBORTag, loads
 		
 		# CBOR decodes synchronously. Build references first, then initialize
@@ -128,13 +137,17 @@ class AsyncRemoteBase():
 		
 		def tag_hook(cbor_tag, immutable):
 			if cbor_tag.tag == self.cbor2_obj_tag:
-				if cbor_tag.value.startswith("coap"):
-					ac = AsyncObjectProxy(uri=cbor_tag.value)
-				else:
-					ac = AsyncObjectProxy(host=self.host, obj_path=cbor_tag.value, root_proxy=self)
-				
+				ac = AsyncObjectProxy(host=self.host, obj_path=cbor_tag.value, root_proxy=self)
 				postponed_init.append(ac)
-				
+				return ac
+			elif cbor_tag.tag == self.cbor2_callback_obj_tag:
+				ac = AsyncObjectProxy(
+					root_proxy=self,
+					obj_path=cbor_tag.value,
+					remote_endpoint=callback_remote,
+					cache_callables=False,
+				)
+				postponed_init.append(ac)
 				return ac
 			
 			return cbor_tag
@@ -151,10 +164,10 @@ class AsyncRemoteBase():
 		
 		def default_encoder(encoder, value):
 			if isinstance(value, AsyncObjectProxy):
-				if value.host == self.host:
-					tag = CBORTag(self.cbor2_obj_tag, value.obj_path)
+				if value.host != self.host:
+					tag = CBORTag(self.cbor2_callback_obj_tag, value.obj_path)
 				else:
-					tag = CBORTag(self.cbor2_obj_tag, value.uri)
+					tag = CBORTag(self.cbor2_obj_tag, value.obj_path)
 				encoder.encode(tag)
 			else:
 				valkey = None
@@ -260,6 +273,8 @@ class AsyncCallableProxy():
 		
 		payload = self.client.dumps({REQUEST_TYPE: REQUEST_CALL, "n": self.name, "a": (args, kwargs)})
 		request = aiocoap.Message(code=aiocoap.POST, uri=self.client.uri, payload=payload)
+		if self.client.remote_endpoint is not None:
+			request.remote = self.client.remote_endpoint
 		
 		response = await self.client.context.request(request).response
 		if response.code != aiocoap.CONTENT:
@@ -273,14 +288,16 @@ class AsyncCallableProxy():
 		return data.get("v", None)
 class AsyncObjectProxy(AsyncRemoteBase):
 	"""Async attribute and method proxy for a remotely registered object."""
-	def __init__(self, host=None, obj_path=None, uri=None, root_proxy=None, cache_callables=True):
+	def __init__(self, host=None, obj_path=None, uri=None, root_proxy=None, cache_callables=True, context=None, remote_endpoint=None):
 		super().__init__()
 		
 		self.root_proxy = root_proxy
 		self.cache_callables = cache_callables
 		self.callables_to = False
 		self.callables = []
-		self.context = None
+		self.context = context
+		self.owns_context = context is None and root_proxy is None
+		self.remote_endpoint = remote_endpoint
 		
 		if host is None:
 			self.host = "coap://localhost"
@@ -322,6 +339,8 @@ class AsyncObjectProxy(AsyncRemoteBase):
 	async def queryCallables(self):
 		payload = self.dumps({REQUEST_TYPE: REQUEST_INDEX})
 		request = aiocoap.Message(code=aiocoap.GET, uri=self.uri, payload=payload)
+		if self.remote_endpoint is not None:
+			request.remote = self.remote_endpoint
 		
 		if self.context is None:
 			await self.create_context()
@@ -342,6 +361,8 @@ class AsyncObjectProxy(AsyncRemoteBase):
 		
 		payload = self.dumps({REQUEST_TYPE: REQUEST_PROPERTY, "n": name})
 		request = aiocoap.Message(code=aiocoap.GET, uri=self.uri, payload=payload)
+		if self.remote_endpoint is not None:
+			request.remote = self.remote_endpoint
 		
 		if self.context is None:
 			await self.create_context()
@@ -372,6 +393,6 @@ class AsyncObjectProxy(AsyncRemoteBase):
 		return self.get(name)
 
 	async def close(self):
-		if self.root_proxy is None and self.context is not None:
+		if self.owns_context and self.context is not None:
 			await self.context.shutdown()
 			self.context = None
